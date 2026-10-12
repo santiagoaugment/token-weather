@@ -11,12 +11,16 @@
 // the last HISTORY readings.
 // session.start: take a first reading, so the band shows before any turn.
 // ui.render (AbovePrompt): one line: icon, forecast word, percent, tokens
-// used of the window, and a block-character chart of the recent turns.
+// used of the window, and a block-character chart of the recent turns,
+// stacked above whatever the plugins beneath draw there.
 //
 // Handoff: past the threshold the person set (/handoff at 60% or 200k, kept
 // across sessions) the band says so and a toast fires once per conversation.
 // /handoff asks a fork of the cached conversation for a handoff note, runs
-// /clear, and puts the note in the fresh conversation's prompt box.
+// /clear, and puts the note in the fresh conversation's prompt box. A /clear
+// the person runs delivers a note still waiting. (classic.SessionStart would
+// be the natural place, but the engine's own security plugin keeps user-tier
+// plugins from it, so the note rides the /clear itself and session.end.)
 //
 // The host reads on(...) and $.noun.method(...) from source, so they are
 // spelled literally, and helpers that take $ are top-level functions.
@@ -39,6 +43,7 @@ const FORECAST = [
 ] as const
 
 const KEY_THRESHOLD = 'threshold'
+const DELIVER_AFTER_MS = 300
 const DEFAULT_THRESHOLD = '60%'
 
 const HANDOFF_PROMPT = `Write a handoff note for a fresh session that has none of this conversation. It will be that session's first message, so it must stand on its own.
@@ -108,18 +113,13 @@ export const register: Register = (on) => {
   })
 
   // /clear starts a new conversation in the same process; session.start does not fire for it.
-  on('classic.SessionStart', async ($, e, next) => {
-    const result = await next(e)
-    if (e.source !== 'clear') return result
-    readings = []
-    warned = false
-    await takeReading($)
-    if (pending) {
-      const note = pending
-      pending = undefined
-      await deliver($, note)
+  on('session.end', async ($, e, next) => {
+    if (e.reason === 'clear') {
+      startOver()
+      // The prompt box is reset as /clear finishes; the note goes in after that.
+      if (pending) $.clock.after(DELIVER_AFTER_MS, () => deliverPending($))
     }
-    return result
+    return next(e)
   })
 
   on('turn.complete', async ($, e, next) => {
@@ -139,12 +139,14 @@ export const register: Register = (on) => {
     return { text: await handoff($) }
   })
 
-  on('ui.render', { component: 'AbovePrompt' }, ($, e, next) => {
-    if (e.hasSurvey || readings.length === 0) {
-      return next(e)
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const rest = await next(e)
+    if (e.props.hasSurvey || readings.length === 0) {
+      return rest
     }
     const { Box, Text } = $.ui.resolve(e)
-    return renderBand(Box, Text, e.bodyColumns ?? 80)
+    const mine = renderBand(Box, Text, e.props.bodyColumns ?? 80)
+    return Box({ flexDirection: 'column', children: rest ? [mine, rest] : [mine] })
   })
 }
 
@@ -183,7 +185,7 @@ async function setThreshold($: $, text: string) {
   const now = readings[readings.length - 1]
   warned = now ? isPast(t, now) : false
   $.ui.invalidate('ui.render')
-  return t.kind === 'off' ? 'Handoff warning off.' : `token-weather will suggest /handoff from ${thresholdText(t)} of context, in every session.`
+  return t.kind === 'off' ? 'Handoff warning off.' : `Will suggest /handoff from ${thresholdText(t)} of context, in every session.`
 }
 
 function statusText() {
@@ -209,8 +211,26 @@ async function clearForHandoff($: $) {
   try {
     await $.command.run({ command: 'clear', args: '' })
   } catch (err) {
-    $.ui.toast(`token-weather: /clear did not run (${String(err)}). Run /clear yourself and the handoff note will be put in the prompt box.`)
+    $.ui.toast(`/clear did not run (${String(err)}). Run /clear yourself and the handoff note will be put in the prompt box.`)
+    return
   }
+  startOver()
+  $.clock.after(DELIVER_AFTER_MS, () => deliverPending($))
+}
+
+// A fresh conversation: usage still reports the last response until the next one, so start at zero.
+function startOver() {
+  const window = readings[readings.length - 1]?.window ?? 0
+  readings = window ? [{ tokens: 0, window, percent: 0 }] : []
+  warned = false
+}
+
+async function deliverPending($: $) {
+  const note = pending
+  if (!note) return
+  pending = undefined
+  await deliver($, note)
+  $.ui.invalidate('ui.render')
 }
 
 async function deliver($: $, note: string) {
@@ -219,34 +239,39 @@ async function deliver($: $, note: string) {
     const filled = await $.prompt.fill({ text })
     if (!filled.isFilled) await $.prompt.submit({ text })
   } catch (err) {
-    $.ui.toast(`token-weather: could not hand the note to the new conversation (${String(err)}).`)
+    $.ui.toast(`Could not hand the note to the new conversation (${String(err)}).`)
   }
 }
 
 type El = (props: Record<string, unknown>) => unknown
+type Part = { text: string; props?: Record<string, unknown>; drop?: number }
 
+// Segments with a drop rank go, highest first, until the line fits the width.
 function renderBand(Box: El, Text: El, columns: number) {
   const now = readings[readings.length - 1]
   const f = forecastFor(now.percent)
   const past = isPast(threshold, now)
   const trend = trendWord()
-  const parts = [
+  const parts: Part[] = [
     past
-      ? Text({ color: 'red', bold: true, children: '↪  Time to hand off' })
-      : Text({ color: f.color, bold: true, children: `${f.icon}  ${f.word}` }),
-    Text({ children: `  ${now.percent}% of context` }),
-    Text({ dimColor: true, children: `  ${short(now.tokens)} / ${short(now.window)}` }),
+      ? { text: '↪  Time to hand off', props: { color: 'red', bold: true } }
+      : { text: `${f.icon}  ${f.word}`, props: { color: f.color, bold: true } },
+    { text: `  ${now.percent}% of context` },
+    { text: `  ${short(now.tokens)} / ${short(now.window)}`, props: { dimColor: true }, drop: 3 },
+    { text: '   last turns ', props: { dimColor: true }, drop: 4 },
+    { text: chart(), props: { color: f.color }, drop: 4 },
   ]
-  if (columns >= 60) {
-    parts.push(Text({ dimColor: true, children: '   last turns ' }))
-    parts.push(Text({ color: f.color, children: chart() }))
-    if (trend) {
-      parts.push(Text({ dimColor: true, children: `  ${trend}` }))
-    }
+  if (trend) parts.push({ text: `  ${trend}`, props: { dimColor: true }, drop: 5 })
+  if (past) parts.push({ text: '   /handoff', props: { color: 'red' } })
+  else if (threshold.kind !== 'off') parts.push({ text: `   handoff at ${thresholdText(threshold)}`, props: { dimColor: true }, drop: 6 })
+  // paddingX takes a column each side.
+  const room = columns - 2
+  let shown = parts
+  for (const rank of [6, 5, 4, 3]) {
+    if (shown.reduce((n, p) => n + p.text.length, 0) <= room) break
+    shown = shown.filter((p) => p.drop !== rank)
   }
-  if (past) parts.push(Text({ color: 'red', children: '   /handoff' }))
-  else if (threshold.kind !== 'off' && columns >= 80) parts.push(Text({ dimColor: true, children: `   handoff at ${thresholdText(threshold)}` }))
-  return Box({ flexDirection: 'row', paddingX: 1, children: parts })
+  return Box({ flexDirection: 'row', paddingX: 1, children: shown.map((p) => Text({ ...p.props, children: p.text })) })
 }
 
 function forecastFor(percent: number) {

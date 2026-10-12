@@ -2,6 +2,8 @@
 
 A Claude Code mod that draws a live forecast of your context window in the band above the prompt. We're sharing it as the smallest of the three mods here: one hooks module that reads real usage figures and draws one line of UI.
 
+> **This fork** (from [anthropics/claude-code-playground](https://github.com/anthropics/claude-code-playground) `claude-code/mods/token-weather`) adds a [handoff](#handoff): past a threshold you set it tells you to hand off, and `/handoff` moves the work to a fresh conversation, so a long session stops re-reading a huge context on every turn.
+
 ## What this shows
 
 ```text
@@ -36,6 +38,20 @@ These are the same figures the status line shows (`total_input_tokens`, `context
 | `session.start` | Takes a first reading, so the band shows before the first turn. |
 | `turn.complete` | Takes a reading after each main-loop turn. Subagent turns are skipped. |
 | `ui.render` with `{component: "AbovePrompt"}` | Draws the band as one line. |
+
+## Handoff
+
+| Command | What it does |
+|---------|--------------|
+| `/handoff at 60%` | Warn at 60% of the context window. Any whole percent from 1 to 99. |
+| `/handoff at 200k` | Warn at a token count instead (`200k`, `1.5m`, `150000`). On a 1M window this is the better measure of cost. |
+| `/handoff at off` | No warning. |
+| `/handoff status` | The threshold and the window's fill now. |
+| `/handoff` | Hand off now. |
+
+The threshold is kept across sessions; it starts at 60%. Past it, the band reads `↪ Time to hand off … /handoff`, a toast fires once per conversation, and `/handoff` is offered as the prompt suggestion.
+
+`/handoff` asks a fork of the conversation for a handoff note (goal, state, decisions, dead ends, next step). The fork reuses the conversation's prompt cache, so the note costs a cache read and a few hundred output tokens. The mod then runs `/clear` and puts the note in the fresh conversation's prompt box, to send as it is or edit first. If the note can't be written, nothing is cleared. If the `/clear` doesn't run, the toast says so, and the next `/clear` you run delivers the note.
 
 ## Demo
 
@@ -99,11 +115,11 @@ No environment variables or configuration.
    claude --plugin-dir ./token-weather
    ```
 
-   Or install it, with the other mods here, from the local marketplace in this folder (see the [mods README](../README.md)):
+   Or install it from the marketplace in this folder:
 
    ```bash
-   claude plugin marketplace add ./
-   claude plugin install token-weather@claude-code-playground-mods --scope user
+   claude plugin marketplace add ./token-weather
+   claude plugin install token-weather@santi-token-weather --scope user
    ```
 
 4. Work as normal. The band updates after each turn.
@@ -115,7 +131,8 @@ No environment variables or configuration.
 - **The chart's bars are relative** to the fullest turn shown, so growth shows even at low fill. The percentage is the absolute figure.
 - **The history resets** when the session starts, or when the plugin reloads.
 - **On a 1M-token window**, ordinary work stays at ☀ for a long time. That's accurate.
-- **One band per session.** Another plugin that draws `AbovePrompt` competes for the same band.
+- **It shares the band.** What other plugins draw above the prompt is stacked beneath this line. On a narrow terminal the line drops its trend, chart and token count, in that order, before it would wrap.
+- **The note rides the `/clear`.** Claude Code's built-in security plugin keeps user-installed plugins out of the classic `SessionStart` event, so the mod hands the note over when its own `/clear` finishes, or at `session.end` for a `/clear` you run.
 - **Before the first response**, the band reads 0%, because no response has reported usage yet.
 
 ## Dependencies

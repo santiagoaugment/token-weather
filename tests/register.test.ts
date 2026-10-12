@@ -24,16 +24,22 @@ const band: RenderPropsOf['AbovePrompt'] = {
 
 // The world beneath the mod: a context window whose fill the test sets, and
 // a record of what the mod asked the engine for.
-function world(on: On, opts: { store?: Record<string, unknown>; fork?: ModelForkResult } = {}) {
+function world(on: On, opts: { store?: Record<string, unknown>; fork?: ModelForkResult; clearFails?: boolean; below?: string } = {}) {
   mock.store(on, opts.store ?? {})
   const live = { tokens: 0, window: 200_000 }
   const seen = { toasts: [] as string[], suggested: [] as string[], filled: [] as string[], cleared: 0, forks: [] as string[] }
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: live.window, tokens: live.tokens, percent: (live.tokens / live.window) * 100 }, rateLimits: [] } }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
-  on('command.run', { command: 'clear' }, () => { seen.cleared++; return {} })
+  on('command.run', { command: 'clear' }, () => {
+    if (opts.clearFails) throw new Error('busy')
+    seen.cleared++
+    return {}
+  })
+  on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+  // The engine beneath draws nothing above the prompt unless a test puts another plugin's band there.
+  on('ui.render', { component: 'AbovePrompt' }, ($, e) => opts.below === undefined ? $.ui.resolve(e).Box({ children: [] }) : $.ui.resolve(e).Text({ children: [opts.below] }))
   on('turn.complete', ($, e) => ({ text: 'answer' in e ? e.answer : '' }))
-  on('classic.SessionStart', () => ({}))
   on('ui.toast', ($, e) => { seen.toasts.push(e.text); return { value: undefined } })
   on('prompt.suggest', ($, e) => { seen.suggested.push(e.text); return { isShown: true } })
   on('prompt.fill', ($, e) => { seen.filled.push(e.text); return { isFilled: true } })
@@ -116,6 +122,7 @@ describe('/handoff', () => {
     const clock = mock.clock(on)
     const { live, seen } = world(on)
     await $.session.start(session)
+    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'AbovePrompt', props: band })
     live.tokens = 150_000
     await $.turn.complete(turn())
     const out = await $.command.run(run('handoff'))
@@ -123,15 +130,28 @@ describe('/handoff', () => {
     expect(out.text).toMatch(/fresh conversation/)
     // The /clear waits until the command has answered.
     expect(seen.cleared).toBe(0)
-    await clock.settle()
+    await clock.advance(1000)
     expect(seen.cleared).toBe(1)
-    expect(seen.toasts.filter(t => /did not run/.test(t))).toEqual([])
-    live.tokens = 0
-    await $.classic.SessionStart({ source: 'clear' })
     expect(seen.filled.length).toBe(1)
     expect(seen.filled[0]).toMatch(/GOAL: ship it\. NEXT: run the tests\./)
+    // The fresh conversation starts the band over, though usage still reports the last response.
+    expect(await ui.find({ type: 'Text', text: /^\s*0% of context/ })).toBeDefined()
     // A later /clear does not bring the same note back.
-    await $.classic.SessionStart({ source: 'clear' })
+    await $.session.end({ reason: 'clear', sessionId: 'S2', resume: { id: 'S2' } })
+    await clock.advance(1000)
+    expect(seen.filled.length).toBe(1)
+  })
+
+  test('when its own /clear is refused, a /clear the person runs delivers the note', async ($, on) => {
+    const clock = mock.clock(on)
+    const { seen } = world(on, { clearFails: true })
+    await $.session.start(session)
+    await $.command.run(run('handoff'))
+    await clock.advance(1000)
+    expect(seen.toasts.some(t => /Run \/clear yourself/.test(t))).toBe(true)
+    expect(seen.filled).toEqual([])
+    await $.session.end({ reason: 'clear', sessionId: 'S1', resume: { id: 'S1' } })
+    await clock.advance(1000)
     expect(seen.filled.length).toBe(1)
   })
 
@@ -144,15 +164,38 @@ describe('/handoff', () => {
   })
 
   test('the warning fires again in the conversation after a handoff', async ($, on) => {
+    const clock = mock.clock(on)
     const { live, seen } = world(on)
     await $.session.start(session)
     live.tokens = 130_000
     await $.turn.complete(turn())
     await $.command.run(run('handoff'))
-    live.tokens = 5_000
-    await $.classic.SessionStart({ source: 'clear' })
+    await clock.advance(1000)
     live.tokens = 125_000
     await $.turn.complete(turn())
     expect(seen.toasts.length).toBe(2)
+  })
+})
+
+describe('band', () => {
+  test('stacks above the band of a plugin beneath it', async ($, on) => {
+    const { live } = world(on, { below: 'cache-tax · warm' })
+    await $.session.start(session)
+    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'AbovePrompt', props: band })
+    live.tokens = 20_000
+    await $.turn.complete(turn())
+    expect(await ui.find({ type: 'Text', text: /10% of context/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'cache-tax · warm' })).toBeDefined()
+  })
+
+  test('drops the chart before it wraps on a narrow terminal', async ($, on) => {
+    const { live } = world(on)
+    await $.session.start(session)
+    const ui = await $.ui.mount({ plugin: 'token-weather', surface: 'terminal', component: 'AbovePrompt', props: { ...band, bodyColumns: 60 } })
+    live.tokens = 150_000
+    await $.turn.complete(turn())
+    const text = (await ui.findAll({ type: 'Text' })).map(t => t.text).join('')
+    expect(text).toMatch(/\/handoff/)
+    expect(text.length).toBeLessThanOrEqual(58)
   })
 })

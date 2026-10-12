@@ -1,6 +1,6 @@
 {
   "name": "token-weather",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A live forecast of the context window above the prompt, plus a handoff: past a threshold you set (/handoff at 60% or 200k) it suggests /handoff, which writes a note, clears, and puts the note in the fresh conversation's prompt box.",
   "author": {
     "name": "Claude Code DevRel; handoff by Santiago Boxiga"
