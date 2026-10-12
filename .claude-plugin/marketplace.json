@@ -1,0 +1,5 @@
+{
+  "name": "santi-token-weather",
+  "owner": { "name": "Santiago" },
+  "plugins": [{ "name": "token-weather", "source": "./" }]
+}
